@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, time
@@ -7,6 +7,21 @@ import psycopg2
 import json
 
 app = FastAPI(title="Gaming Twin Backend")
+
+# ---------- API key middleware ----------
+
+@app.middleware("http")
+async def api_key_auth(request: Request, call_next):
+    # allow unauthenticated access only for root and health
+    if request.url.path in ["/", "/health"]:
+        return await call_next(request)
+
+    api_key_header = request.headers.get("X-API-KEY")
+    expected = os.getenv("API_KEY")
+    if not expected or api_key_header != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return await call_next(request)
 
 # ---------- Models ----------
 
@@ -42,7 +57,9 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
     cur.execute(
         """
         INSERT INTO digital_twins (user_id, thresholds, aggregates, state, created_at, last_updated)
-        VALUES (%s, '{"daily":120,"night":60}', '{"today_minutes":0,"weekly_minutes":0,"night_minutes":0,"sessions_per_day":0}', 'Healthy', NOW(), NOW())
+        VALUES (%s, '{"daily":120,"night":60}',
+                   '{"today_minutes":0,"weekly_minutes":0,"night_minutes":0,"sessions_per_day":0}',
+                   'Healthy', NOW(), NOW())
         ON CONFLICT (user_id) DO NOTHING
         """,
         (user_id,)
