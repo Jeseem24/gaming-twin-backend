@@ -24,7 +24,7 @@ async def api_key_auth(request: Request, call_next):
 # ---------- Models ----------
 class GamingEvent(BaseModel):
     user_id: str
-    childdeviceid: str  # NEW: Matches integration doc
+    childdeviceid: str  # ✅ Integration doc requirement
     game_name: str
     duration: int
 
@@ -121,7 +121,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
     else:
         state = "Excessive"
 
-    # NEW: Compute risk_level and alert_message for Member 3
+    # ✅ Member 3: risk_level and alert_message
     risk_level = 'Unknown'
     alert_message = ''
     if today_minutes > daily_th:
@@ -131,7 +131,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
         risk_level = 'Medium'
         alert_message = f"Night gaming detected ({night_minutes} mins)"
 
-    # Update with NEW columns
+    # Update with ALL fields
     cur.execute(
         """
         UPDATE digital_twins
@@ -178,6 +178,12 @@ def ingest_event(event: GamingEvent):
             (event.user_id, event.childdeviceid, event.game_name, event.duration, now)
         )
 
+        # ✅ PDF requirement: Set isnight flag
+        cur.execute(
+            "UPDATE events SET isnight = %s WHERE id = currval('events_id_seq')",
+            (is_night(now),)
+        )
+
         update_aggregates(conn, event.user_id, event.duration, now)
 
         conn.commit()
@@ -212,8 +218,8 @@ def get_twin(user_id: str):
             "thresholds": row[1],
             "aggregates": row[2],
             "state": row[3],
-            "risk_level": row[4],      # NEW
-            "alert_message": row[5]    # NEW
+            "risk_level": row[4],
+            "alert_message": row[5]
         }
     except HTTPException:
         raise
