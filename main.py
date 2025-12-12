@@ -11,7 +11,8 @@ app = FastAPI(title="Gaming Twin Backend")
 # ---------- API key middleware ----------
 @app.middleware("http")
 async def api_key_auth(request: Request, call_next):
-    if request.url.path in ["/", "/health"]:
+    # allow unauthenticated access only for root, health, and parent login
+    if request.url.path in ["/", "/health", "/parent/login"]:
         return await call_next(request)
 
     api_key_header = request.headers.get("X-API-KEY")
@@ -21,16 +22,28 @@ async def api_key_auth(request: Request, call_next):
 
     return await call_next(request)
 
+
 # ---------- Models ----------
 class GamingEvent(BaseModel):
     user_id: str
-    childdeviceid: str  # ✅ Integration doc requirement
+    childdeviceid: str
+    package_name: str
     game_name: str
-    duration: int
+    start_time: int       # epoch ms
+    end_time: int         # epoch ms
+    timestamp: int        # epoch ms (session end)
+    duration: int         # minutes
+
 
 class ThresholdUpdate(BaseModel):
     daily: Optional[int] = None
     night: Optional[int] = None
+
+
+class ParentLoginRequest(BaseModel):
+    username: str
+    password: str
+
 
 # ---------- Database connection ----------
 def get_db_connection():
@@ -39,6 +52,7 @@ def get_db_connection():
         raise RuntimeError("DATABASE_URL not set")
     return psycopg2.connect(db_url)
 
+
 # ---------- Helper functions ----------
 def is_night(now: datetime) -> bool:
     start = time(22, 0)
@@ -46,10 +60,11 @@ def is_night(now: datetime) -> bool:
     t = now.time()
     return t >= start or t < end
 
+
 def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
     cur = conn.cursor()
 
-    # Ensure twin row exists
+    # ensure twin row exists
     cur.execute(
         """
         INSERT INTO digital_twins (user_id, thresholds, aggregates, state, risk_level, alert_message, created_at, last_updated)
@@ -61,11 +76,11 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
         (user_id,)
     )
 
-    # Today/week boundaries
+    # today / week boundaries
     today = event_time.date()
     week_start = today.fromordinal(today.toordinal() - 6)
 
-    # Recompute aggregates from events
+    # recompute aggregates from events
     cur.execute(
         """
         SELECT duration, event_time
@@ -101,7 +116,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
         "sessions_per_day": sessions_per_day,
     }
 
-    # Get thresholds
+    # get thresholds
     cur.execute(
         "SELECT thresholds FROM digital_twins WHERE user_id = %s",
         (user_id,)
@@ -112,7 +127,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
     else:
         thresholds = {"daily": 120, "night": 60}
 
-    # Compute state
+    # compute state
     daily_th = thresholds.get("daily", 120)
     if today_minutes <= daily_th * 0.5:
         state = "Healthy"
@@ -121,17 +136,16 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
     else:
         state = "Excessive"
 
-    # ✅ Member 3: risk_level and alert_message
-    risk_level = 'Unknown'
-    alert_message = ''
+    # compute risk_level and alert_message
+    risk_level = "Unknown"
+    alert_message = ""
     if today_minutes > daily_th:
-        risk_level = 'High'
+        risk_level = "High"
         alert_message = f"Daily gaming exceeded threshold ({today_minutes} > {daily_th} mins)"
     elif night_minutes > thresholds.get("night", 60):
-        risk_level = 'Medium'
+        risk_level = "Medium"
         alert_message = f"Night gaming detected ({night_minutes} mins)"
 
-    # Update with ALL fields
     cur.execute(
         """
         UPDATE digital_twins
@@ -149,6 +163,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
     conn.commit()
     cur.close()
 
+
 # ---------- Endpoints ----------
 @app.get("/health")
 def health():
@@ -163,28 +178,53 @@ def health():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
 @app.post("/events")
 def ingest_event(event: GamingEvent):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
 
-        now = datetime.utcnow()
+        # derive datetime from mobile timestamp (ms)
+        event_dt = datetime.utcfromtimestamp(event.timestamp / 1000.0)
+
         cur.execute(
             """
-            INSERT INTO events (user_id, childdeviceid, game_name, duration, event_time)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO events (
+                user_id,
+                childdeviceid,
+                package_name,
+                game_name,
+                duration,
+                event_time,
+                start_time_bigint,
+                end_time_bigint,
+                event_timestamp_bigint
+            )
+            VALUES (%s, %s, %s, %s, %s,
+                    TO_TIMESTAMP(%s / 1000.0),
+                    %s, %s, %s)
             """,
-            (event.user_id, event.childdeviceid, event.game_name, event.duration, now)
+            (
+                event.user_id,
+                event.childdeviceid,
+                event.package_name,
+                event.game_name,
+                event.duration,
+                event.timestamp,
+                event.start_time,
+                event.end_time,
+                event.timestamp,
+            )
         )
 
-        # ✅ PDF requirement: Set isnight flag
+        # mark night usage based on event time
         cur.execute(
             "UPDATE events SET isnight = %s WHERE id = currval('events_id_seq')",
-            (is_night(now),)
+            (is_night(event_dt),)
         )
 
-        update_aggregates(conn, event.user_id, event.duration, now)
+        update_aggregates(conn, event.user_id, event.duration, event_dt)
 
         conn.commit()
         cur.close()
@@ -192,6 +232,7 @@ def ingest_event(event: GamingEvent):
         return {"status": "processed", "user_id": event.user_id}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 @app.get("/digital-twin/{user_id}")
 def get_twin(user_id: str):
@@ -219,12 +260,13 @@ def get_twin(user_id: str):
             "aggregates": row[2],
             "state": row[3],
             "risk_level": row[4],
-            "alert_message": row[5]
+            "alert_message": row[5],
         }
     except HTTPException:
         raise
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 @app.get("/reports/{user_id}")
 def get_reports(user_id: str):
@@ -258,6 +300,7 @@ def get_reports(user_id: str):
         raise
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 @app.post("/digital-twin/{user_id}/threshold")
 def update_threshold(user_id: str, body: ThresholdUpdate):
@@ -296,3 +339,16 @@ def update_threshold(user_id: str, body: ThresholdUpdate):
         return {"user_id": user_id, "thresholds": thresholds}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/parent/login")
+def parent_login(body: ParentLoginRequest):
+    # simple mock login for integration
+    return {
+        "success": True,
+        "parent_id": "parent_001",
+        "token": "jwt_token_here",
+        "children": [
+            {"child_id": "child_101", "name": "John"}
+        ]
+    }
