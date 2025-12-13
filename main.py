@@ -5,6 +5,7 @@ from datetime import datetime, time
 import os
 import psycopg2
 import json
+import requests  # NEW: for calling Member 3 API
 
 app = FastAPI(title="Gaming Twin Backend")
 
@@ -127,7 +128,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
     else:
         thresholds = {"daily": 120, "night": 60}
 
-    # compute state
+    # fallback rule-based state
     daily_th = thresholds.get("daily", 120)
     if today_minutes <= daily_th * 0.5:
         state = "Healthy"
@@ -136,15 +137,33 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
     else:
         state = "Excessive"
 
-    # compute risk_level and alert_message
     risk_level = "Unknown"
     alert_message = ""
-    if today_minutes > daily_th:
-        risk_level = "High"
-        alert_message = f"Daily gaming exceeded threshold ({today_minutes} > {daily_th} mins)"
-    elif night_minutes > thresholds.get("night", 60):
-        risk_level = "Medium"
-        alert_message = f"Night gaming detected ({night_minutes} mins)"
+
+    # ---------- CALL MEMBER 3 ML API ----------
+    twin_json = {
+        "user_id": user_id,
+        "thresholds": thresholds,
+        "aggregates": aggregates,
+        "state": state,
+    }
+
+    try:
+        ml_response = requests.post(
+            "http://localhost:9100/analyze-ml",  # replace with Member 3 URL in deployment
+            json={"digital_twin": twin_json},
+            timeout=3,
+        ).json()
+
+        # These keys MUST match what Member 3 actually returns.
+        # Ask him to confirm names like: state, severity, alertmessage.
+        state = ml_response.get("state", state)
+        risk_level = ml_response.get("severity", risk_level)
+        alert_message = ml_response.get("alertmessage", alert_message)
+    except Exception:
+        # if ML service is down or contract mismatch, keep fallback values
+        pass
+    # -----------------------------------------
 
     cur.execute(
         """
@@ -185,7 +204,6 @@ def ingest_event(event: GamingEvent):
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # derive datetime from mobile timestamp (ms)
         event_dt = datetime.utcfromtimestamp(event.timestamp / 1000.0)
 
         cur.execute(
@@ -343,7 +361,6 @@ def update_threshold(user_id: str, body: ThresholdUpdate):
 
 @app.post("/parent/login")
 def parent_login(body: ParentLoginRequest):
-    # simple mock login for integration
     return {
         "success": True,
         "parent_id": "parent_001",
