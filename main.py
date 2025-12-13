@@ -5,7 +5,7 @@ from datetime import datetime, time
 import os
 import psycopg2
 import json
-import requests  # NEW: for calling Member 3 API
+import requests  # for ML API call
 
 app = FastAPI(title="Gaming Twin Backend")
 
@@ -138,9 +138,9 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
         state = "Excessive"
 
     risk_level = "Unknown"
-    alert_message = ""
+    alert_message: list[str] | str = []
 
-    # ---------- CALL MEMBER 3 ML API ----------
+    # ---------- CALL MEMBER 3 ML API (FINAL CONTRACT) ----------
     twin_json = {
         "user_id": user_id,
         "thresholds": thresholds,
@@ -150,20 +150,22 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime):
 
     try:
         ml_response = requests.post(
-            "http://localhost:9100/analyze-ml",  # replace with Member 3 URL in deployment
+            "http://localhost:9100/analyze-ml",  # Member 3 service URL (local)
             json={"digital_twin": twin_json},
             timeout=3,
         ).json()
 
-        # These keys MUST match what Member 3 actually returns.
-        # Ask him to confirm names like: state, severity, alertmessage.
+        # Use ML output (confirmed keys)
         state = ml_response.get("state", state)
         risk_level = ml_response.get("severity", risk_level)
         alert_message = ml_response.get("alertmessage", alert_message)
+        if isinstance(alert_message, list):
+            alert_message = "; ".join(alert_message)
     except Exception:
-        # if ML service is down or contract mismatch, keep fallback values
-        pass
-    # -----------------------------------------
+        # ML down or error → keep fallback
+        if isinstance(alert_message, list):
+            alert_message = ""
+    # -----------------------------------------------------------
 
     cur.execute(
         """
