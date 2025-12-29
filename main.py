@@ -8,7 +8,9 @@ import json
 import requests
 
 app = FastAPI(title="Gaming Twin Backend")
-ML_URL = os.getenv("ML_API_URL", "http://localhost:9100/analyze-ml")
+
+# ML URL from environment
+ML_URL = os.getenv("ML_API_URL", "https://digital-twin-gaming-ml.onrender.com/analyze-ml")
 
 @app.middleware("http")
 async def api_key_auth(request: Request, call_next):
@@ -20,7 +22,7 @@ async def api_key_auth(request: Request, call_next):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return await call_next(request)
 
-# ---------- Updated Models ----------
+# ---------- MODELS ----------
 class GamingEvent(BaseModel):
     user_id: str
     childdeviceid: str
@@ -40,7 +42,7 @@ class ParentLoginRequest(BaseModel):
     username: str
     password: str
 
-# ---------- Database ----------
+# ---------- DATABASE ----------
 def get_db_connection():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
@@ -54,7 +56,7 @@ def is_night(now: datetime) -> bool:
     return t >= start or t < end
 
 def cleanup_stale_sessions(conn):
-    """Background task: Set offline if no heartbeat > 5 min"""
+    """Set offline if no heartbeat > 5 min"""
     cur = conn.cursor()
     five_min_ago = datetime.utcnow() - timedelta(minutes=5)
     
@@ -64,17 +66,15 @@ def cleanup_stale_sessions(conn):
         WHERE is_online = TRUE 
         AND (last_heartbeat_at IS NULL OR last_heartbeat_at < %s)
     """, (five_min_ago,))
-    
     conn.commit()
     cur.close()
 
 def check_and_trigger_alert(conn, user_id: str):
-    """Check if daily limit exceeded and trigger alert logic"""
+    """Instant alert if daily limit exceeded"""
     cur = conn.cursor()
     cur.execute("""
         SELECT aggregates, thresholds 
-        FROM digital_twins 
-        WHERE user_id = %s
+        FROM digital_twins WHERE user_id = %s
     """, (user_id,))
     row = cur.fetchone()
     cur.close()
@@ -86,14 +86,13 @@ def check_and_trigger_alert(conn, user_id: str):
         daily_limit = thresholds.get("daily", 120)
         
         if today_minutes > daily_limit:
-            # Alert logic: In production, send push notification here
             print(f"🚨 ALERT: {user_id} exceeded daily limit {today_minutes}/{daily_limit} min")
-            # TODO: Integrate with parent push notification service
+            # TODO: Send push notification to parent
 
-def update_aggregates(conn, user_id: str, duration: int, event_time: datetime, status: str):
+def update_aggregates(conn, user_id: str, duration: int, event_time: datetime, status: str, game_name: str):
     cur = conn.cursor()
 
-    # Ensure twin row exists
+    # Ensure twin exists
     cur.execute("""
         INSERT INTO digital_twins (user_id, thresholds, aggregates, state, risk_level, alert_message, 
                                    is_online, current_game, last_heartbeat_at, created_at, last_updated)
@@ -102,7 +101,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime, s
         ON CONFLICT (user_id) DO NOTHING
     """, (user_id,))
 
-    # Recompute aggregates from events
+    # Recompute aggregates
     today = event_time.date()
     week_start = today.fromordinal(today.toordinal() - 6)
     
@@ -153,7 +152,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime, s
     risk_level = "Unknown"
     alert_message = ""
 
-    # ML API call
+    # ML API
     twin_json = {"user_id": user_id, "thresholds": thresholds, "aggregates": aggregates, "state": state}
     try:
         ml_response = requests.post(ML_URL, json={"digital_twin": twin_json}, timeout=3).json()
@@ -171,14 +170,14 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime, s
             UPDATE digital_twins 
             SET is_online = TRUE, current_game = %s, last_heartbeat_at = NOW()
             WHERE user_id = %s
-        """, (event.game_name, user_id))
+        """, (game_name, user_id))
     elif status == "HEARTBEAT":
         cur.execute("""
             UPDATE digital_twins 
             SET last_heartbeat_at = NOW()
             WHERE user_id = %s
         """, (user_id,))
-        check_and_trigger_alert(conn, user_id)  # Instant alert check
+        check_and_trigger_alert(conn, user_id)
     elif status == "STOP":
         cur.execute("""
             UPDATE digital_twins 
@@ -187,7 +186,7 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime, s
         """, (user_id,))
     # --------------------------------------
 
-    # Update aggregates and ML results
+    # Save aggregates + ML results
     cur.execute("""
         UPDATE digital_twins
         SET aggregates = %s, thresholds = %s, state = %s, risk_level = %s, 
@@ -198,12 +197,12 @@ def update_aggregates(conn, user_id: str, duration: int, event_time: datetime, s
     conn.commit()
     cur.close()
 
-# ---------- Updated Endpoints ----------
+# ---------- ENDPOINTS ----------
 @app.get("/health")
 def health():
     try:
         conn = get_db_connection()
-        cleanup_stale_sessions(conn)  # Clean stale sessions on health check
+        cleanup_stale_sessions(conn)
         cur = conn.cursor()
         cur.execute("SELECT 1")
         cur.fetchone()
@@ -231,7 +230,7 @@ def ingest_event(event: GamingEvent):
         cur.execute("UPDATE events SET isnight = %s WHERE id = currval('events_id_seq')", (is_night(event_dt),))
 
         # Update twin with status logic
-        update_aggregates(conn, event.user_id, event.duration, event_dt, event.status)
+        update_aggregates(conn, event.user_id, event.duration, event_dt, event.status, event.game_name)
 
         conn.commit()
         cur.close()
@@ -264,16 +263,15 @@ def get_twin(user_id: str):
             "state": row[3],
             "risk_level": row[4],
             "alert_message": row[5],
-            "is_online": row[6],           # NEW
-            "current_game": row[7],         # NEW
-            "last_heartbeat_at": row[8]     # NEW
+            "is_online": row[6],
+            "current_game": row[7],
+            "last_heartbeat_at": row[8]
         }
     except HTTPException:
         raise
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# Keep other endpoints same (reports, threshold, parent/login)
 @app.get("/reports/{user_id}")
 def get_reports(user_id: str):
     try:
